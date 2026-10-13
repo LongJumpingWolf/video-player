@@ -126,6 +126,7 @@ svg text { fill: currentColor; stroke: none; font-size: 9.5px; font-weight: 700;
 /* Home + drop overlay */
 #home { position: absolute; inset: 0; display: grid; place-items: center; z-index: 1; background: radial-gradient(circle at 50% 30%, #1d2630, #000 70%); }
 #home .home-card { text-align: center; padding: 24px; max-width: 420px; }
+.home-btns { display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; }
 #home h1 { margin: 0 0 8px; font-size: 32px; }
 #home p { color: var(--muted); margin: 0 0 24px; line-height: 1.5; }
 #player.has-video #home { display: none; }

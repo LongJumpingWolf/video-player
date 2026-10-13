@@ -33,20 +33,60 @@
   const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const CLOSE_SVG = '<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>';
 
+  /* ---------- Storage: files in IndexedDB, small state in localStorage ---------- */
+  const QUEUE_KEY = 'offlinePlayerQueue', PROGRESS_KEY = 'offlinePlayerProgress';
+  let dbp = null;
+  const openDb = () => dbp || (dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('offlinePlayer', 1);
+    r.onupgradeneeded = () => { r.result.createObjectStore('files'); r.result.createObjectStore('meta'); };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  }));
+  const idb = async (store, mode, fn) => {
+    const d = await openDb();
+    return new Promise((res, rej) => {
+      const t = d.transaction(store, mode), r = fn(t.objectStore(store));
+      t.oncomplete = () => res(r && r.result);
+      t.onerror = t.onabort = () => rej(t.error);
+    });
+  };
+  const idbPut = (s, k, v) => idb(s, 'readwrite', o => o.put(v, k)).catch(() => {});
+  const idbGet = (s, k) => idb(s, 'readonly', o => o.get(k)).catch(() => undefined);
+  const idbDel = (s, k) => idb(s, 'readwrite', o => o.delete(k)).catch(() => {});
+  try { navigator.storage?.persist?.(); } catch {}   // ask the browser not to evict our saved videos
+
+  // A file's identity: name + size + last-modified. Same file picked again => same key => same progress.
+  const fileKey = f => `${f.name}|${f.size}|${f.lastModified}`;
+  const readJson = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } };
+  const writeJson = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+  const getProgress = key => readJson(PROGRESS_KEY, {})[key];
+  function setProgress(key, t, d) { const all = readJson(PROGRESS_KEY, {}); all[key] = { t, d }; writeJson(PROGRESS_KEY, all); }
+  function clearProgress(key) { const all = readJson(PROGRESS_KEY, {}); if (key in all) { delete all[key]; writeJson(PROGRESS_KEY, all); } }
+
   /* ---------- Queue state ---------- */
-  let items = [];      // { id, file, name, url, thumb, duration }
+  let items = [];      // { key, file, name, url, thumb, duration }
   let index = -1;
-  let nextId = 1;
+  let finished = null; // item that just finished playing; removed from the queue once we move on
+  let ready = false;   // true once the current video's saved position has been applied
+
+  const saveQueue = () => writeJson(QUEUE_KEY, { order: items.map(i => i.key), current: items[index]?.key ?? null });
 
   function addFiles(fileList) {
     const files = [...fileList].filter(f => f.type.startsWith('video/') || /\.(mp4|mkv|webm|mov|m4v|avi|ogv)$/i.test(f.name));
-    if (!files.length) return;
-    const wasEmpty = items.length === 0 || index < 0;
-    const added = files.map(file => ({ id: nextId++, file, name: stripExt(file.name), url: URL.createObjectURL(file), thumb: '', duration: 0 }));
-    items.push(...added);
-    renderQueue();
+    const added = [];
+    for (const file of files) {
+      const key = fileKey(file);
+      if (items.some(i => i.key === key)) continue;           // already queued
+      const item = { key, file, name: stripExt(file.name), url: URL.createObjectURL(file), thumb: '', duration: 0 };
+      items.push(item); added.push(item);
+      idbPut('files', key, file);
+      idbPut('meta', key, { name: item.name, thumb: '', duration: 0 });
+    }
+    if (!added.length) return;
+    const wasEmpty = index < 0;
+    saveQueue(); renderQueue();
     if (wasEmpty) playIndex(items.indexOf(added[0]));
-    added.forEach(it => makeThumb(it));
+    added.forEach(makeThumb);
   }
 
   // Grab a frame + duration using a throwaway video element (serialised so big files don't pile up)
@@ -69,7 +109,9 @@
           c.getContext('2d').drawImage(v, 0, 0, w, h);
           item.thumb = c.toDataURL('image/jpeg', .7);
         } catch {}
-        clearTimeout(timer); renderQueue(); done();
+        clearTimeout(timer);
+        if (items.includes(item)) idbPut('meta', item.key, { name: item.name, thumb: item.thumb, duration: item.duration });
+        renderQueue(); done();
       };
       v.onerror = () => { clearTimeout(timer); done(); };
     }));
@@ -78,6 +120,8 @@
   function renderQueue() {
     els.queueCount.textContent = items.length;
     els.queueCount.hidden = items.length === 0;
+    $('homeResume').hidden = items.length === 0 || player.classList.contains('has-video');
+    $('homeResume').textContent = `Resume queue (${items.length})`;
     els.queueList.innerHTML = items.map((it, i) => `
       <li data-i="${i}" class="${i === index ? 'current' : ''}">
         <div class="t">${it.thumb ? `<img src="${it.thumb}" alt="">` : ''}${it.duration ? `<em>${fmt(it.duration)}</em>` : ''}</div>
@@ -86,50 +130,99 @@
       </li>`).join('');
   }
 
-  function playIndex(i) {
+  // Remember where we are in a video (skipped near the start / end, and while switching videos)
+  function saveProgressFor(it) {
+    if (!it || !ready || finished === it || !video.duration) return;
+    const t = video.currentTime;
+    if (t > 3 && t < video.duration - 5) setProgress(it.key, t, video.duration);
+    else clearProgress(it.key);
+  }
+  const saveCurrentProgress = () => saveProgressFor(items[index]);
+
+  function discard(it) {            // forget a video entirely: object URL + stored copy
+    URL.revokeObjectURL(it.url);
+    idbDel('files', it.key); idbDel('meta', it.key);
+  }
+
+  function dropFinished() {         // a finished video leaves the queue (and its progress is wiped)
+    if (!finished) return;
+    const it = finished; finished = null;
+    const i = items.indexOf(it);
+    if (i >= 0) { items.splice(i, 1); if (i < index) index--; else if (i === index) index = -1; }
+    discard(it); clearProgress(it.key);
+    saveQueue(); renderQueue();
+  }
+
+  function playIndex(i, { autoplay = true } = {}) {
     if (i < 0 || i >= items.length) return;
+    saveCurrentProgress();
     cancelCountdown();
-    index = i;
-    const it = items[i];
-    video.src = it.url;
+    const target = items[i];
+    dropFinished();
+    index = items.indexOf(target);
+    ready = false;
+    video.src = target.url;
     video.playbackRate = prefs.speed;
     resetZoom();
-    els.title.textContent = it.name;
-    document.title = it.name + ' · Offline Player';
+    els.title.textContent = target.name;
+    document.title = target.name + ' · Offline Player';
     player.classList.add('has-video');
-    renderQueue();
-    video.play().catch(() => {});
+    saveQueue(); renderQueue();
+    if (autoplay) video.play().catch(() => {});
     showControls();
   }
 
-  function removeAt(i) {
-    const [it] = items.splice(i, 1);
-    URL.revokeObjectURL(it.url);
+  function removeAt(i) {            // manual removal: the file goes, its saved progress is kept
+    const it = items[i];
+    if (i === index) saveProgressFor(it);
+    items.splice(i, 1);
+    if (finished === it) finished = null;
+    discard(it);
     if (i === index) {
-      if (items.length) { index = -1; playIndex(Math.min(i, items.length - 1)); }
+      if (items.length) { index = -1; ready = false; playIndex(Math.min(i, items.length - 1)); }
       else stopPlayback();
     } else if (i < index) index--;
-    renderQueue();
+    saveQueue(); renderQueue();
   }
 
   function stopPlayback() {
-    cancelCountdown();
+    saveCurrentProgress();
+    cancelCountdown(); dropFinished();
     video.pause(); video.removeAttribute('src'); video.load();
-    index = -1; els.title.textContent = '';
+    index = -1; ready = false; els.title.textContent = '';
     document.title = 'Offline Player';
     player.classList.remove('has-video', 'playing');
-    closePanels(); resetZoom(); renderQueue();
+    closePanels(); resetZoom(); saveQueue(); renderQueue();
   }
 
   /* ---------- Transport ---------- */
   const toggle = () => video.paused ? video.play().catch(() => {}) : video.pause();
   const seekBy = d => { video.currentTime = Math.max(0, Math.min(video.duration || 0, video.currentTime + d)); };
 
+  let lastSave = 0;
   video.addEventListener('play', () => { player.classList.add('playing'); scheduleHide(); });
-  video.addEventListener('pause', () => { player.classList.remove('playing'); showControls(); });
-  video.addEventListener('timeupdate', updateProgress);
-  video.addEventListener('loadedmetadata', () => { video.playbackRate = prefs.speed; updateProgress(); });
-  video.addEventListener('ended', () => { if (index + 1 < items.length) startCountdown(); else showControls(); });
+  video.addEventListener('pause', () => { player.classList.remove('playing'); saveCurrentProgress(); showControls(); });
+  video.addEventListener('timeupdate', () => {
+    updateProgress();
+    const now = performance.now();
+    if (now - lastSave > 2000) { lastSave = now; saveCurrentProgress(); }
+  });
+  video.addEventListener('loadedmetadata', () => {
+    video.playbackRate = prefs.speed;
+    const it = items[index], p = it && getProgress(it.key);
+    if (p && p.t > 0 && p.t < video.duration - 5) video.currentTime = p.t;   // resume where we left off
+    ready = true;
+    updateProgress();
+  });
+  video.addEventListener('ended', () => {
+    const it = items[index];
+    if (!it) return;
+    finished = it; clearProgress(it.key);
+    if (index + 1 < items.length) startCountdown();
+    else stopPlayback();                                  // last one done: it leaves the queue
+  });
+  window.addEventListener('pagehide', saveCurrentProgress);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveCurrentProgress(); });
 
   function updateProgress() {
     const d = video.duration || 0, t = video.currentTime || 0, p = d ? t / d * 100 : 0;
@@ -194,7 +287,8 @@
   const openPicker = () => { els.file.value = ''; els.file.click(); };
   $('addBtn').onclick = $('homeOpen').onclick = $('queueAdd').onclick = openPicker;
   els.file.onchange = () => addFiles(els.file.files);
-  $('queueClear').onclick = () => { items.forEach(i => URL.revokeObjectURL(i.url)); items = []; stopPlayback(); };
+  $('queueClear').onclick = () => { saveCurrentProgress(); items.forEach(discard); items = []; finished = null; stopPlayback(); };
+  $('homeResume').onclick = () => playIndex(0);
 
   els.queueList.addEventListener('click', e => {
     const rm = e.target.closest('[data-rm]');
@@ -225,7 +319,8 @@
   }
   function cancelCountdown() { clearInterval(cdTimer); cdTimer = null; els.upnext.hidden = true; }
   $('cdPlay').onclick = () => playIndex(index + 1);
-  $('cdCancel').onclick = () => { cancelCountdown(); showControls(); };
+  const cancelUpNext = () => stopPlayback();   // the finished video leaves the queue; the rest stays
+  $('cdCancel').onclick = cancelUpNext;
 
   /* ---------- Zoom (pinch / pan / wheel only: no double-tap zoom, video only) ---------- */
   const z = { s: 1, x: 0, y: 0 };
@@ -434,11 +529,26 @@
     else if (k === 'p') playIndex(index - 1);
     else if (k === 'q') $('queueBtn').click();
     else if (k === '0') resetZoom();
-    else if (k === 'escape') { closePanels(); cancelCountdown(); }
+    else if (k === 'escape') { closePanels(); if (!els.upnext.hidden) cancelUpNext(); }
     else return;
     showControls();
   });
 
   applyPrefs();
   renderQueue();
+
+  // Bring back the queue (and the video we were on, paused at its saved position) after a reload / browser restart
+  (async () => {
+    const q = readJson(QUEUE_KEY, null);
+    if (!q || !Array.isArray(q.order)) return;
+    for (const key of q.order) {
+      const file = await idbGet('files', key);
+      if (!file) continue;
+      const meta = (await idbGet('meta', key)) || {};
+      items.push({ key, file, name: meta.name || stripExt(file.name || key), url: URL.createObjectURL(file), thumb: meta.thumb || '', duration: meta.duration || 0 });
+    }
+    const cur = items.findIndex(i => i.key === q.current);
+    renderQueue();
+    if (cur >= 0) playIndex(cur, { autoplay: false }); else saveQueue();
+  })();
 })();
