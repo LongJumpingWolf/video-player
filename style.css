@@ -25,6 +25,8 @@ svg text { fill: currentColor; stroke: none; font-size: 9.5px; font-weight: 700;
 .pill { background: var(--pill); backdrop-filter: blur(18px) saturate(1.4); -webkit-backdrop-filter: blur(18px) saturate(1.4); border-radius: 999px; }
 .circle { width: 50px; height: 50px; border-radius: 50%; background: var(--pill); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); display: grid; place-items: center; }
 .circle svg { width: 24px; height: 24px; }
+.circle.on { background: var(--accent); color: #000; }
+#player:not(.has-video) #pipBtn { visibility: hidden; }
 .circle.sm { width: 40px; height: 40px; background: var(--pill-hi); }
 .circle.sm svg { width: 20px; height: 20px; }
 .icon-btn { width: 54px; height: 54px; display: grid; place-items: center; border-radius: 50%; position: relative; }

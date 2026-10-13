@@ -111,7 +111,7 @@
         } catch {}
         clearTimeout(timer);
         if (items.includes(item)) idbPut('meta', item.key, { name: item.name, thumb: item.thumb, duration: item.duration });
-        renderQueue(); done();
+        renderQueue(); if (items[index] === item) updateMediaSession(); done();
       };
       v.onerror = () => { clearTimeout(timer); done(); };
     }));
@@ -167,7 +167,7 @@
     els.title.textContent = target.name;
     document.title = target.name + ' · Offline Player';
     player.classList.add('has-video');
-    saveQueue(); renderQueue();
+    saveQueue(); renderQueue(); updateMediaSession();
     if (autoplay) video.play().catch(() => {});
     showControls();
   }
@@ -192,7 +192,7 @@
     index = -1; ready = false; els.title.textContent = '';
     document.title = 'Offline Player';
     player.classList.remove('has-video', 'playing');
-    closePanels(); resetZoom(); saveQueue(); renderQueue();
+    closePanels(); resetZoom(); saveQueue(); renderQueue(); updateMediaSession();
   }
 
   /* ---------- Transport ---------- */
@@ -284,6 +284,54 @@
   $('fwdBtn').onclick = () => seekBy(prefs.skip);
   $('closeBtn').onclick = stopPlayback;
   $('fsBtn').onclick = () => document.fullscreenElement ? document.exitFullscreen() : (player.requestFullscreen || player.webkitRequestFullscreen)?.call(player);
+  /* ---------- Mini player (Picture-in-Picture) + system media controls ---------- */
+  const pipBtn = $('pipBtn');
+  const stdPip = !!(document.pictureInPictureEnabled && video.requestPictureInPicture);
+  const webkitPip = 'webkitSetPresentationMode' in video;      // iPhone / iPad Safari
+  pipBtn.hidden = !(stdPip || webkitPip);
+  const inPip = () => document.pictureInPictureElement === video || video.webkitPresentationMode === 'picture-in-picture';
+  async function togglePip() {
+    if (!player.classList.contains('has-video')) return;
+    try {
+      if (inPip()) {
+        if (document.pictureInPictureElement) await document.exitPictureInPicture();
+        else video.webkitSetPresentationMode('inline');
+      } else if (stdPip) await video.requestPictureInPicture();
+      else video.webkitSetPresentationMode('picture-in-picture');
+    } catch {}
+  }
+  pipBtn.onclick = togglePip;
+  const syncPip = () => pipBtn.classList.toggle('on', inPip());
+  ['enterpictureinpicture', 'leavepictureinpicture', 'webkitpresentationmodechanged'].forEach(t => video.addEventListener(t, syncPip));
+
+  // Media Session: title/artwork plus play, pause, skip back/forward and a scrubber in the PiP window,
+  // on the lock screen and in Control Center. Next/previous-track handlers are deliberately NOT set,
+  // because iOS/iPadOS would show those buttons instead of the skip back/forward ones.
+  const ms = 'mediaSession' in navigator ? navigator.mediaSession : null;
+  function updateMediaSession() {
+    if (!ms) return;
+    const it = items[index];
+    try {
+      ms.metadata = it ? new MediaMetadata({ title: it.name, artist: 'Offline Player', artwork: it.thumb ? [{ src: it.thumb, sizes: '320x180', type: 'image/jpeg' }] : [] }) : null;
+    } catch {}
+  }
+  function syncPosition() {
+    if (!ms || !ms.setPositionState || !isFinite(video.duration) || !video.duration) return;
+    try { ms.setPositionState({ duration: video.duration, playbackRate: video.playbackRate || 1, position: Math.min(video.currentTime, video.duration) }); } catch {}
+  }
+  if (ms) {
+    const on = (action, fn) => { try { ms.setActionHandler(action, fn); } catch {} };
+    on('play', () => video.play().catch(() => {}));
+    on('pause', () => video.pause());
+    on('seekbackward', d => seekBy(-(d?.seekOffset || prefs.skip)));
+    on('seekforward', d => seekBy(d?.seekOffset || prefs.skip));
+    on('seekto', d => { if (d.fastSeek && video.fastSeek) video.fastSeek(d.seekTime); else video.currentTime = d.seekTime; });
+    ['play', 'pause'].forEach(t => video.addEventListener(t, () => { ms.playbackState = video.paused ? 'paused' : 'playing'; syncPosition(); }));
+    ['loadedmetadata', 'seeked', 'ratechange'].forEach(t => video.addEventListener(t, syncPosition));
+    let lastPos = 0;
+    video.addEventListener('timeupdate', () => { const n = performance.now(); if (n - lastPos > 1000) { lastPos = n; syncPosition(); } });
+  }
+
   const openPicker = () => { els.file.value = ''; els.file.click(); };
   $('addBtn').onclick = $('homeOpen').onclick = $('queueAdd').onclick = openPicker;
   els.file.onchange = () => addFiles(els.file.files);
@@ -525,6 +573,7 @@
     else if (k === 'arrowup') { video.volume = Math.min(1, video.volume + .05); e.preventDefault(); }
     else if (k === 'arrowdown') { video.volume = Math.max(0, video.volume - .05); e.preventDefault(); }
     else if (k === 'f') $('fsBtn').click();
+    else if (k === 'i') togglePip();
     else if (k === 'n') playIndex(index + 1);
     else if (k === 'p') playIndex(index - 1);
     else if (k === 'q') $('queueBtn').click();
